@@ -1,0 +1,26 @@
+[package]
+name = "stakker_mio"
+version = "0.0.1"
+authors = ["Jim Peters <jim@uazu.net>"]
+edition = "2018"
+
+description = "Mio I/O polling integration for the Stakker crate"
+license = "MIT/Apache-2.0"
+readme = "README.md"
+
+repository = "https://github.com/uazu/stakker"
+documentation = "https://docs.rs/stakker"
+
+keywords = [ "mio", "event-loop", "stakker" ]
+categories = [ "asynchronous", "network-programming" ]
+
+[badges]
+maintenance = { status = "experimental" }
+
+[dependencies]
+stakker = "0.0"
+slab = "0.4"
+
+[dependencies.mio]
+version = "0.7.0-alpha.1"
+features = ["os-poll", "os-util", "tcp", "udp", "uds"]
