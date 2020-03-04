@@ -1,7 +1,7 @@
 use crate::mio::event::{Event, Source};
 use crate::mio::{Events, Interest, Poll, Token, Waker};
 use slab::Slab;
-use stakker::{fwd_nop, Core, Fwd, Stakker};
+use stakker::{fwd_nop, Fwd, Stakker};
 use std::cell::RefCell;
 use std::io::{Error, ErrorKind, Result};
 use std::ops::{Deref, DerefMut};
@@ -88,7 +88,8 @@ impl MioPoll {
             waker,
         };
 
-        ctrl.set_wake_fwd(Fwd::new(|c, _| c.defer(|s| s.poll_wake())));
+        let deferrer = stakker.deferrer();
+        ctrl.set_wake_fwd(Fwd::new(move |_| deferrer.defer(|s| s.poll_wake())));
 
         let miopoll = Self {
             rc: Rc::new(RefCell::new(ctrl)),
@@ -137,9 +138,8 @@ impl MioPoll {
     }
 
     /// Poll for new events and queue all the events of the highest
-    /// available priority level to the provided Stakker `Core`.
-    /// Events of lower priority levels are queued internally to be
-    /// used on a future call to this method.
+    /// available priority level.  Events of lower priority levels are
+    /// queued internally to be used on a future call to this method.
     ///
     /// So the expected pattern is that highest-priority handlers get
     /// run, and when all the resulting processing has completed in
@@ -150,8 +150,8 @@ impl MioPoll {
     ///
     /// On success returns `Ok(true)` if an event was processed, or
     /// `Ok(false)` if there were no new events.
-    pub fn poll(&self, core: &mut Core, max_delay: Duration) -> Result<bool> {
-        self.rc.borrow_mut().poll(core, max_delay)
+    pub fn poll(&self, max_delay: Duration) -> Result<bool> {
+        self.rc.borrow_mut().poll(max_delay)
     }
 
     /// Set the handler for "wake" events.  There can only be one
@@ -230,7 +230,7 @@ impl Control {
         Ok(token)
     }
 
-    fn poll(&mut self, core: &mut Core, max_delay: Duration) -> Result<bool> {
+    fn poll(&mut self, max_delay: Duration) -> Result<bool> {
         self.poll.poll(&mut self.events, Some(max_delay))?;
         let mut done = false;
         for ev in &self.events {
@@ -242,7 +242,7 @@ impl Control {
                 let ready = Ready::new(ev);
                 if entry.pri == self.max_pri {
                     done = true;
-                    entry.fwd.fwd(core, ready);
+                    entry.fwd.fwd(ready);
                 } else {
                     self.queues[entry.pri as usize].push(QueueEvent { token, ready });
                 }
@@ -255,7 +255,7 @@ impl Control {
                     for qev in qu.drain(..) {
                         if let Some(ref mut entry) = self.token_map.get_mut(qev.token) {
                             done = true;
-                            entry.fwd.fwd(core, qev.ready);
+                            entry.fwd.fwd(qev.ready);
                         }
                     }
                     if done {
