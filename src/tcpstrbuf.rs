@@ -22,6 +22,15 @@ pub struct TcpStreamBuf {
     /// [`TcpStreamBuf::flush`]: struct.TcpStreamBuf.html#method.flush
     pub out: Vec<u8>,
 
+    /// Output EOF flag.  When this is set to `true` and the `out`
+    /// buffer fully empties in a [`TcpStreamBuf::flush`] call, the
+    /// outgoing half of the stream will be shut down, which signals
+    /// end-of-file.  If any data is added to `out` after this point
+    /// it will give an error from `flush`.
+    ///
+    /// [`TcpStreamBuf::flush`]: struct.TcpStreamBuf.html#method.flush
+    pub out_eof: bool,
+
     /// Input buffer.  To receive data, read data from offset `rd` up
     /// to offset `wr`, updating `rd` offset as you go.  Call
     /// [`TcpStreamBuf::read`] to pull more data into the buffer,
@@ -39,6 +48,9 @@ pub struct TcpStreamBuf {
     /// Offset for writing in input buffer
     pub wr: usize,
 
+    // Set when EOF has been sent
+    sent_out_eof: bool,
+
     // Active TCP connection, or None
     stream: Option<MioSource<TcpStream>>,
 }
@@ -49,9 +61,11 @@ impl TcpStreamBuf {
     pub fn new() -> Self {
         Self {
             out: Vec::new(),
+            out_eof: false,
             inp: Vec::new(),
             rd: 0,
             wr: 0,
+            sent_out_eof: false,
             stream: None,
         }
     }
@@ -69,6 +83,7 @@ impl TcpStreamBuf {
     /// [`TcpStreamBuf::read`]: struct.TcpStreamBuf.html#method.read
     pub fn init(&mut self, stream: MioSource<TcpStream>) {
         self.stream = Some(stream);
+        self.sent_out_eof = false;
     }
 
     /// Discard the current stream if there is one, deregistering it
@@ -97,10 +112,21 @@ impl TcpStreamBuf {
             loop {
                 match stream.flush() {
                     Err(ref e) if e.kind() == ErrorKind::Interrupted => (),
-                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => return Ok(()),
                     Err(e) => return Err(e),
                     Ok(_) => break,
                 };
+            }
+            if self.out_eof && !self.sent_out_eof && self.out.is_empty() {
+                loop {
+                    match stream.shutdown(std::net::Shutdown::Write) {
+                        Err(ref e) if e.kind() == ErrorKind::Interrupted => (),
+                        Err(ref e) if e.kind() == ErrorKind::WouldBlock => return Ok(()),
+                        Err(e) => return Err(e),
+                        Ok(_) => break,
+                    };
+                }
+                self.sent_out_eof = true;
             }
         }
         Ok(())
