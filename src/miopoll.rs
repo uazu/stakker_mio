@@ -49,6 +49,18 @@ impl<S: Source> DerefMut for MioSource<S> {
     }
 }
 
+/// Handle EINTR failures by retrying
+#[inline]
+fn retry<R>(mut f: impl FnMut() -> Result<R>) -> Result<R> {
+    loop {
+        let rv = f();
+        match rv {
+            Err(ref e) if e.kind() == ErrorKind::Interrupted => (),
+            _ => return rv,
+        }
+    }
+}
+
 /// Ref-counting wrapper around a mio `Poll` instance
 ///
 /// After creation, pass cloned copies of this to all interested
@@ -75,7 +87,7 @@ impl MioPoll {
             fwd: fwd_nop!(),
         }));
         assert_eq!(waker_token, WAKER_TOKEN);
-        let waker = Arc::new(Waker::new(poll.registry(), WAKER_TOKEN)?);
+        let waker = Arc::new(retry(|| Waker::new(poll.registry(), WAKER_TOKEN))?);
         let waker2 = waker.clone();
 
         let mut ctrl = Control {
@@ -97,7 +109,7 @@ impl MioPoll {
 
         stakker.anymap_set(miopoll.clone());
         stakker.set_poll_waker(move || {
-            if let Err(e) = waker2.wake() {
+            if let Err(e) = retry(|| waker2.wake()) {
                 panic!("Inter-thread poll waker failed: {}", e);
             }
         });
@@ -207,7 +219,7 @@ struct Control {
 impl Control {
     #[inline]
     fn del(&mut self, token: Token, handle: &mut impl Source) -> Result<()> {
-        let rv = self.poll.registry().deregister(handle);
+        let rv = retry(|| self.poll.registry().deregister(handle));
         if self.token_map.contains(token.into()) {
             self.token_map.remove(token.into());
             return rv;
@@ -226,12 +238,12 @@ impl Control {
         let pri = pri.min(MAX_PRI);
         self.max_pri = self.max_pri.max(pri);
         let token = Token(self.token_map.insert(Entry { pri, fwd }));
-        self.poll.registry().register(handle, token, ready)?;
+        retry(|| self.poll.registry().register(handle, token, ready))?;
         Ok(token)
     }
 
     fn poll(&mut self, max_delay: Duration) -> Result<bool> {
-        self.poll.poll(&mut self.events, Some(max_delay))?;
+        retry(|| self.poll.poll(&mut self.events, Some(max_delay)))?;
         let mut done = false;
         for ev in &self.events {
             let token = ev.token().into();
@@ -297,7 +309,8 @@ impl Ready {
             };
         }
         // TODO: Ask 'mio' maintainers to add #[inline] if these
-        // aren't getting inlined
+        // aren't getting inlined.  Alternatively if it's very heavy,
+        // add crate features to enable only what's required.
         let val = test!(ev.is_readable(), READY_RD)
             + test!(ev.is_writable(), READY_WR)
             + test!(ev.is_error(), READY_ERROR)

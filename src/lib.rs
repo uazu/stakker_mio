@@ -1,4 +1,4 @@
-//! Integrates mio into **Stakker**.
+//! Integrates **mio** into **Stakker**.
 //!
 //! [`MioPoll`] is the main type.  It handles polling and converting
 //! mio events into **Stakker** forward calls.  It offers priority
@@ -11,9 +11,15 @@
 //! [`FdSource`] wraps an arbitrary UNIX file descriptor for use with
 //! [`MioPoll`].
 //!
+//! All calls retry on `ErrorKind::Interrupted` internally, so this
+//! error doesn't have to be handled by the caller.  Retrying is the
+//! most helpful behaviour in a non-blocking event loop.  In an app
+//! using blocking I/O you might want a blocked call to be cut short
+//! on a signal, but that case doesn't apply here.
+//!
 //! The mio version used by this library is re-exported as
 //! `stakker_mio::mio`.  This should be used by applications in place
-//! of importing mio directly, to make sure they're using the same
+//! of importing mio directly, to guarantee they're using the same
 //! version.
 //!
 //! [`FdSource`]: struct.FdSource.html
