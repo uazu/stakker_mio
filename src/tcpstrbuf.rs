@@ -2,15 +2,29 @@ use crate::mio::net::TcpStream;
 use crate::MioSource;
 use std::io::{Error, ErrorKind, Read, Result, Write};
 
-/// Type to aid with managing a [`mio::net::TcpStream`] along with [`MioPoll`]
+/// Type to aid with managing a [`mio::net::TcpStream`] along with
+/// [`MioPoll`]
 ///
 /// First create the stream and add it to [`MioPoll`], then pass the
 /// resulting [`MioSource`] to [`TcpStreamBuf::init`], which allows
 /// this struct to manage the buffering.
 ///
+/// By default TCP_NODELAY is set to `false` on the stream.  However
+/// if you're writing large chunks of data, it is recommended to
+/// enable TCP_NODELAY by calling [`TcpStreamBuf::set_nodelay`] with
+/// `true`.  This disables the Nagle algorithm, which means that the
+/// last packet of a large write will arrive sooner at the
+/// destination.  However if you are writing very small amounts, and
+/// would benefit from the Nagle algorithm batching up data despite
+/// the extra round-trip, then it's fine to leave it as `false`.
+/// Since on Windows the TCP_NODELAY flag can only be changed once the
+/// stream is writable, it is set on the first flush after each new
+/// stream is installed.
+///
 /// [`MioPoll`]: struct.MioPoll.html
 /// [`MioSource`]: struct.MioSource.html
 /// [`TcpStreamBuf::init`]: struct.TcpStreamBuf.html#method.init
+/// [`TcpStreamBuf::set_nodelay`]: struct.TcpStreamBuf.html#method.set_nodelay
 /// [`mio::net::TcpStream`]: ../mio/net/struct.TcpStream.html
 #[derive(Default)]
 pub struct TcpStreamBuf {
@@ -48,6 +62,12 @@ pub struct TcpStreamBuf {
     /// Offset for writing in input buffer
     pub wr: usize,
 
+    // TCP_NODELAY flag
+    nodelay: bool,
+
+    // Pending set_nodelay()
+    pending_set_nodelay: bool,
+
     // Set when EOF has been sent
     sent_out_eof: bool,
 
@@ -65,6 +85,8 @@ impl TcpStreamBuf {
             inp: Vec::new(),
             rd: 0,
             wr: 0,
+            nodelay: false,
+            pending_set_nodelay: false,
             sent_out_eof: false,
             stream: None,
         }
@@ -84,6 +106,7 @@ impl TcpStreamBuf {
     pub fn init(&mut self, stream: MioSource<TcpStream>) {
         self.stream = Some(stream);
         self.sent_out_eof = false;
+        self.pending_set_nodelay = true;
     }
 
     /// Discard the current stream if there is one, deregistering it
@@ -94,9 +117,30 @@ impl TcpStreamBuf {
         self.stream = None;
     }
 
+    /// Change the TCP_NODELAY setting for the stream.  Passing `true`
+    /// disables the Nagle algorithm.  The change will be applied on
+    /// the next flush.
+    pub fn set_nodelay(&mut self, nodelay: bool) {
+        if self.nodelay != nodelay {
+            self.nodelay = nodelay;
+            self.pending_set_nodelay = true;
+        }
+    }
+
     /// Flush as much data as possible out to the stream
     pub fn flush(&mut self) -> Result<()> {
         if let Some(ref mut stream) = self.stream {
+            if self.pending_set_nodelay {
+                self.pending_set_nodelay = false;
+                loop {
+                    match stream.set_nodelay(self.nodelay) {
+                        Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+                        Err(e) => return Err(e),
+                        Ok(()) => break,
+                    }
+                }
+            }
+
             while !self.out.is_empty() {
                 match stream.write(&self.out[..]) {
                     Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
