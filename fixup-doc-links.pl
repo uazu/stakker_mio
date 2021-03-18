@@ -62,7 +62,7 @@ sub process_section {
         print OUT @curr;
         return;
     }
-    
+
     # Drop existing link-defs, and any trailing blank lines
     while (@curr > 0 && $curr[@curr-1] =~ m|^\s*//[/!]\s*\[.*\]:|) {
         pop @curr;
@@ -70,7 +70,7 @@ sub process_section {
     while (@curr > 0 && $curr[@curr-1] =~ m|^\s*//[/!]\s*$|) {
         pop @curr;
     }
-    
+
     # Make a list of [`...`] links
     my %links = ();
     my $data = join('', @curr);
@@ -79,7 +79,7 @@ sub process_section {
         $links{$1} = 1;
     }
     my @linkdefs = ();
-    
+
     # Generate defs for them
     for my $link (sort keys %links) {
         my $fn;
@@ -118,8 +118,8 @@ sub process_section {
                 push @linkdefs, "$link: $href";
                 if (defined $id) {
                     my $html = readfile($fnpath);
-                    print "WARNING: Missing anchor '$id' in file: $fnpath\n" 
-                        unless $html =~ /'$id'/;
+                    print "WARNING: Missing anchor '$id' in file: $fnpath\n"
+                        unless $html =~ /['"]$id['"]/;
                 }
                 $found = 1;
                 last;
@@ -127,9 +127,9 @@ sub process_section {
         }
         if (!$found) {
             print("WARNING: Doc file not found in any of these locations:\n  " . join("\n  ", @href) . "\n");
-        } 
+        }
     }
-    
+
     # Append
     if (@linkdefs) {
         my $linepre = $curr[0];
@@ -137,7 +137,7 @@ sub process_section {
         push @curr, "$linepre\n";
         push @curr, "$linepre $_\n" for (@linkdefs);
     }
-    
+
     print OUT @curr;
 }
 
@@ -145,25 +145,25 @@ for my $fnam (@rs) {
     my $ofnam = "$fnam-NEW";
     @curr = ();
     $prefix = '';
-    
+
     die "Can't open file: $fnam" unless open IN, "<$fnam";
     die "Can't create file: $ofnam" unless open OUT, ">$ofnam";
     while (<IN>) {
         my $pre = '';
         $pre = $1 if m|^\s*(//[/!])|s;
-        
+
         if ($pre ne $prefix) {
             process_section();
             @curr = ();
             $prefix = $pre;
         }
-        
+
         push @curr, $_;
     }
     process_section() if @curr;
     die "Failed reading file: $fnam" unless close IN;
     die "Failed writing file: $ofnam" unless close OUT;
-    
+
     if ($inplace) {
         my $f1 = readfile($fnam);
         my $f2 = readfile($ofnam);

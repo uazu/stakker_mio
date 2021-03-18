@@ -7,7 +7,11 @@ use std::io::{Error, ErrorKind, Read, Result, Write};
 ///
 /// First create the stream and add it to [`MioPoll`], then pass the
 /// resulting [`MioSource`] to [`TcpStreamBuf::init`], which allows
-/// this struct to manage the buffering.
+/// this struct to manage the buffering.  Your ready handler should
+/// call [`TcpStreamBuf::flush`] when the socket is WRITABLE, and
+/// [`TcpStreamBuf::read`] when the socket is READABLE, although you
+/// might want to delay some of the read calls using
+/// [`stakker::idle!`] if you wish to implement backpressure.
 ///
 /// By default TCP_NODELAY is set to `false` on the stream.  However
 /// if you're writing large chunks of data, it is recommended to
@@ -23,9 +27,12 @@ use std::io::{Error, ErrorKind, Read, Result, Write};
 ///
 /// [`MioPoll`]: struct.MioPoll.html
 /// [`MioSource`]: struct.MioSource.html
+/// [`TcpStreamBuf::flush`]: struct.TcpStreamBuf.html#method.flush
 /// [`TcpStreamBuf::init`]: struct.TcpStreamBuf.html#method.init
+/// [`TcpStreamBuf::read`]: struct.TcpStreamBuf.html#method.read
 /// [`TcpStreamBuf::set_nodelay`]: struct.TcpStreamBuf.html#method.set_nodelay
 /// [`mio::net::TcpStream`]: ../mio/net/struct.TcpStream.html
+/// [`stakker::idle!`]: ../stakker/macro.idle.html
 #[derive(Default)]
 pub struct TcpStreamBuf {
     /// Output buffer.  Append data here, and then call
@@ -184,7 +191,7 @@ impl TcpStreamBuf {
     /// need to apply backpressure when under load, call this method
     /// from a [`stakker::idle!`] handler.  This must be called
     /// repeatedly until it returns `ReadStatus::WouldBlock` in order
-    /// to get another read notification from `mio`.
+    /// to get another READABLE ready-notification from `mio`.
     ///
     /// [`stakker::idle!`]: ../stakker/macro.idle.html
     pub fn read(&mut self, max: usize) -> ReadStatus {
