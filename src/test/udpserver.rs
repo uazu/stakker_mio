@@ -1,14 +1,12 @@
-use crate::{mio::net::UdpSocket, mio::Interest, MioPoll, Ready, UdpQueue};
+use crate::{mio::net::UdpSocket, mio::Interest, MioPoll, Ready, UdpServerQueue};
 use stakker::{actor, call, fail, fwd_to, ret_shutdown, stop, Actor, StopCause, CX};
 use std::net::Ipv4Addr;
-use std::net::SocketAddrV4;
+use std::net::{SocketAddr, SocketAddrV4};
 
-// TODO: Add test that shows UDP packet loss due to overflowing OS
-// buffer
-
-/// Test opening two UDP sockets and passing data.  Also tests
-/// truncation of data when a too-small receive buffer is provided.
-pub fn test_udp() {
+/// Test opening two UDP sockets and passing data, but without
+/// connecting them.  So both sending and receiving passes the
+/// address.
+pub fn test_udpserver() {
     let mut stakker = super::init();
     let s = &mut stakker;
 
@@ -16,11 +14,13 @@ pub fn test_udp() {
     let recv_sock = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into()).unwrap();
     let send_sock_addr = send_sock.local_addr().unwrap();
     let recv_sock_addr = recv_sock.local_addr().unwrap();
-    send_sock.connect(recv_sock_addr).unwrap();
-    recv_sock.connect(send_sock_addr).unwrap();
 
     let send = actor!(s, Sender::init(send_sock), ret_shutdown!(s));
-    let _recv = actor!(s, Receiver::init(recv_sock, send.clone()), ret_shutdown!(s));
+    let _recv = actor!(
+        s,
+        Receiver::init(recv_sock, send.clone(), send_sock_addr, recv_sock_addr),
+        ret_shutdown!(s)
+    );
 
     super::run(s);
 
@@ -34,13 +34,13 @@ pub fn test_udp() {
 
 /// Actor which sends test data
 struct Sender {
-    queue: UdpQueue,
+    queue: UdpServerQueue,
 }
 
 impl Sender {
     fn init(cx: CX![], socket: UdpSocket) -> Option<Self> {
         let mut this = Sender {
-            queue: UdpQueue::new(),
+            queue: UdpServerQueue::new(),
         };
         if let Err(e) = this.init_aux(cx, socket) {
             fail!(cx, "Failed to create listening socket: {}", e);
@@ -72,30 +72,41 @@ impl Sender {
         }
     }
 
-    fn send_data(&mut self, cx: CX![], data: Vec<u8>) {
+    fn send_data(&mut self, cx: CX![], addr: SocketAddr, data: Vec<u8>) {
         println!("Sending {} bytes", data.len());
-        self.queue.push(data);
+        self.queue.push(addr, data);
         self.flush(cx);
     }
 }
 
-// Some of these are oversized for receive buffer, intentionally
-const TEST_SIZES: [usize; 7] = [999, 100, 1234, 410, 600, 2000, 751];
+// These sizes must not be oversized for the receive buffer because
+// behaviour on Windows and UNIX vary in that case
+const TEST_SIZES: [usize; 7] = [999, 100, 1023, 410, 600, 200, 751];
 
 struct Receiver {
-    queue: UdpQueue,
+    queue: UdpServerQueue,
     next_index: usize,
     expecting: Option<Vec<u8>>,
     sender: Actor<Sender>,
+    send_addr: SocketAddr,
+    recv_addr: SocketAddr,
 }
 
 impl Receiver {
-    fn init(cx: CX![], socket: UdpSocket, sender: Actor<Sender>) -> Option<Self> {
+    fn init(
+        cx: CX![],
+        socket: UdpSocket,
+        sender: Actor<Sender>,
+        send_addr: SocketAddr,
+        recv_addr: SocketAddr,
+    ) -> Option<Self> {
         let mut this = Self {
-            queue: UdpQueue::new(),
+            queue: UdpServerQueue::new(),
             next_index: 0,
             expecting: None,
             sender,
+            send_addr,
+            recv_addr,
         };
         if let Err(e) = this.init_aux(cx, socket) {
             fail!(cx, "Failed to create listening socket: {}", e);
@@ -128,14 +139,14 @@ impl Receiver {
 
     fn ready_aux(&mut self, cx: CX![]) -> std::io::Result<()> {
         let mut buf = [0; 1024];
-        while let Some(slice) = self.queue.read(&mut buf)? {
-            println!("Received {} bytes", slice.len());
+        while let Some((addr, slice)) = self.queue.read(&mut buf)? {
+            println!("Received {} bytes from {}", slice.len(), addr);
+            if addr != self.send_addr {
+                continue;
+            }
             if let Some(exp) = self.expecting.take() {
-                assert_eq!(
-                    &exp[..exp.len().min(1024)],
-                    slice,
-                    "Received data doesn't match expected"
-                );
+                assert_ne!(slice.len(), 1024, "Not expecting data to be truncated");
+                assert_eq!(exp, slice, "Received data doesn't match expected");
                 self.next_packet(cx);
             } else {
                 panic!("Received a packet, but no data expected: {:?}", slice);
@@ -151,7 +162,7 @@ impl Receiver {
         } else {
             let data = super::testdata(TEST_SIZES[self.next_index], self.next_index as u32);
             self.next_index += 1;
-            call!([self.sender], send_data(data.clone()));
+            call!([self.sender], send_data(self.recv_addr, data.clone()));
             self.expecting = Some(data);
         }
     }

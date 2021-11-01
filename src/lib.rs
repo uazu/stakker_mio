@@ -37,6 +37,7 @@ pub use mio;
 mod miopoll;
 mod tcpstrbuf;
 mod udpqueue;
+mod udpserverqueue;
 
 #[cfg(test)]
 mod test;
@@ -44,6 +45,7 @@ mod test;
 pub use miopoll::{MioPoll, MioSource, Ready};
 pub use tcpstrbuf::{ReadStatus, TcpStreamBuf};
 pub use udpqueue::UdpQueue;
+pub use udpserverqueue::UdpServerQueue;
 
 #[cfg(unix)]
 mod fdsource;
