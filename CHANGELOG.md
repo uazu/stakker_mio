@@ -2,6 +2,10 @@
 
 <!-- see keepachangelog.com for format ideas -->
 
+## 0.2.4 (2022-09-06)
+
+Update to `mio` version 0.8.*
+
 ## 0.2.3 (2021-11-01)
 
 ### Added

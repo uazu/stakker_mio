@@ -1,6 +1,6 @@
 [package]
 name = "stakker_mio"
-version = "0.2.3"
+version = "0.2.4"
 authors = ["Jim Peters <jim@uazu.net>"]
 edition = "2018"
 
@@ -22,5 +22,5 @@ stakker = { version = "0.2", path = "../stakker" }
 slab = "0.4"
 
 [dependencies.mio]
-version = "0.7"
-features = ["os-poll", "os-util", "tcp", "udp", "uds"]
+version = "0.8"
+features = ["os-poll", "os-ext", "net"]
