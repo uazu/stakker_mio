@@ -25,6 +25,18 @@ use std::io::{Error, ErrorKind, Read, Result, Write};
 /// stream is writable, it is set on the first flush after each new
 /// stream is installed.
 ///
+/// The output buffer is a simple `Vec`, because the pattern of
+/// behaviour is expected to be that it will generally be flushed out
+/// in its entirety.  However the input buffer is a pre-filled `Vec`
+/// with separate read and write offsets.  Data is received from the
+/// TCP stream to advance the write offset.  It is expected that data
+/// will be grabbed from the read offset in the buffer by the
+/// application as soon as an entire line or entire record is
+/// available (depending on the protocol), advancing the read offset.
+/// This means it will often be necessary to leave an incomplete line
+/// or record in the buffer until more data has been read from the TCP
+/// stream to complete it.  So using offsets saves some copying.
+///
 /// [`MioPoll`]: struct.MioPoll.html
 /// [`MioSource`]: struct.MioSource.html
 /// [`TcpStreamBuf::flush`]: struct.TcpStreamBuf.html#method.flush
@@ -40,6 +52,10 @@ pub struct TcpStreamBuf {
     /// receiving backpressure from the remote end then you'll see
     /// data here building up.
     ///
+    /// `TcpStreamBuf` has a `Write` trait implementation which may be
+    /// used to write data to this buffer.  Flushing via the `Write`
+    /// trait does not flush to the TCP end-point, though.
+    ///
     /// [`TcpStreamBuf::flush`]: struct.TcpStreamBuf.html#method.flush
     pub out: Vec<u8>,
 
@@ -53,15 +69,28 @@ pub struct TcpStreamBuf {
     pub out_eof: bool,
 
     /// Input buffer.  To receive data, read data from offset `rd` up
-    /// to offset `wr`, updating `rd` offset as you go.  Call
+    /// to offset `wr`, updating the `rd` offset as you go.  Call
     /// [`TcpStreamBuf::read`] to pull more data into the buffer,
-    /// which will update both `rd` and `wr` offsets (dropping data
-    /// before `rd`).  To apply backpressure to the remote end, use
-    /// [`stakker::idle!`] for the `read()` call.
+    /// which will update `wr` offset and also possibly the `rd`
+    /// offset (to drop unneeded data before `rd`).  To apply
+    /// backpressure to the remote end, use [`stakker::idle!`] for the
+    /// `read()` call.
+    ///
+    /// `TcpStreamBuf` has a `Read` trait implementation which may be
+    /// used to read data from this buffer, updating the `rd` offset
+    /// accordingly.
     ///
     /// [`TcpStreamBuf::read`]: struct.TcpStreamBuf.html#method.read
     /// [`stakker::idle!`]: ../stakker/macro.idle.html
     pub inp: Vec<u8>,
+
+    /// Input EOF flag.  This is set by the [`TcpStreamBuf::read`]
+    /// call when it returns `ReadStatus::EndOfStream`.  The
+    /// application should process the EOF only once it has finished
+    /// reading any data remaining in the `inp` buffer.
+    ///
+    /// [`TcpStreamBuf::read`]: struct.TcpStreamBuf.html#method.read
+    pub inp_eof: bool,
 
     /// Offset for reading in input buffer
     pub rd: usize,
@@ -78,6 +107,9 @@ pub struct TcpStreamBuf {
     // Set when EOF has been sent
     sent_out_eof: bool,
 
+    // Pause writes?
+    pause: bool,
+
     // Active TCP connection, or None
     stream: Option<MioSource<TcpStream>>,
 }
@@ -90,11 +122,13 @@ impl TcpStreamBuf {
             out: Vec::new(),
             out_eof: false,
             inp: Vec::new(),
+            inp_eof: false,
             rd: 0,
             wr: 0,
             nodelay: false,
             pending_set_nodelay: false,
             sent_out_eof: false,
+            pause: false,
             stream: None,
         }
     }
@@ -134,8 +168,24 @@ impl TcpStreamBuf {
         }
     }
 
+    /// Pause or unpause writes made by the [`TcpStreamBuf::flush`]
+    /// call.  If `pause` is set to `true`, then
+    /// [`TcpStreamBuf::flush`] does nothing.  Initially it is set to
+    /// `false` which allows writes.  This may be used on Windows
+    /// where writes will fail if attempted before the first "ready
+    /// for write" indication is received from `mio`.
+    ///
+    /// [`TcpStreamBuf::flush`]: struct.TcpStreamBuf.html#method.flush
+    pub fn pause_writes(&mut self, pause: bool) {
+        self.pause = pause;
+    }
+
     /// Flush as much data as possible out to the stream
     pub fn flush(&mut self) -> Result<()> {
+        if self.pause {
+            return Ok(());
+        }
+
         if let Some(ref mut stream) = self.stream {
             if self.pending_set_nodelay {
                 self.pending_set_nodelay = false;
@@ -183,6 +233,37 @@ impl TcpStreamBuf {
         Ok(())
     }
 
+    /// Make space in the `inp` Vec to read in up to `max` bytes of
+    /// data in addition to whatever is already there.  Tries to avoid
+    /// unnecessary copies.
+    pub fn inp_makespace(&mut self, max: usize) {
+        if self.rd == self.wr {
+            self.rd = 0;
+            self.wr = 0;
+        }
+
+        if self.wr + max <= self.inp.len() {
+            return;
+        }
+
+        if self.rd != 0 {
+            self.inp.copy_within(self.rd..self.wr, 0);
+            self.wr -= self.rd;
+            self.rd = 0;
+            if self.wr + max <= self.inp.len() {
+                return;
+            }
+        }
+
+        // If we make it at least `max*2` long, then that should
+        // reduce the amount of copying and reallocation
+        let end = (self.wr + max).max(max * 2);
+        if self.inp.len() < end {
+            self.inp.reserve(end - self.inp.len());
+            self.inp.resize(self.inp.capacity(), 0);
+        }
+    }
+
     /// Read more data and append it to the data currently in the
     /// `inp` buffer.  This is non-blocking.  Bytes before the `rd`
     /// offset might be dropped from the buffer, and `rd` might be
@@ -195,23 +276,15 @@ impl TcpStreamBuf {
     ///
     /// [`stakker::idle!`]: ../stakker/macro.idle.html
     pub fn read(&mut self, max: usize) -> ReadStatus {
-        if self.rd != 0 {
-            self.inp.copy_within(self.rd..self.wr, 0);
-            self.wr -= self.rd;
-            self.rd = 0;
-        }
+        // Extend buffer if required
+        self.inp_makespace(max);
 
         if let Some(ref mut stream) = self.stream {
-            // Extend buffer if required
             let end = self.wr + max;
-            if self.inp.len() < end {
-                self.inp.reserve(end - self.inp.len());
-                self.inp.resize(self.inp.capacity(), 0);
-            }
-
             loop {
-                match stream.read(&mut self.inp[self.wr..]) {
+                match stream.read(&mut self.inp[self.wr..end]) {
                     Ok(0) => {
+                        self.inp_eof = true;
                         return ReadStatus::EndOfStream;
                     }
                     Ok(len) => {
@@ -231,6 +304,69 @@ impl TcpStreamBuf {
             }
         }
         ReadStatus::WouldBlock
+    }
+
+    /// Transfer outgoing data to the `upstream` TcpStreamBuf, and
+    /// pull incoming data down from the `upstream` TcpStreamBuf.
+    /// Also passes through EOF flags both ways.
+    pub fn exchange(&mut self, upstream: &mut Self) {
+        // Output
+        if !self.out.is_empty() {
+            upstream.out.append(&mut self.out);
+        }
+        if self.out_eof {
+            upstream.out_eof = true;
+        }
+
+        // Input
+        let read_len = upstream.wr - upstream.rd;
+        if read_len > 0 {
+            self.inp_makespace(read_len);
+            self.inp[self.wr..self.wr + read_len]
+                .copy_from_slice(&upstream.inp[upstream.rd..upstream.wr]);
+            self.wr += read_len;
+            upstream.rd = 0;
+            upstream.wr = 0;
+        }
+        if upstream.inp_eof {
+            self.inp_eof = true;
+        }
+    }
+}
+
+impl std::io::Read for TcpStreamBuf {
+    /// Read data from the `inp` buffer, advancing the `rd` offset.
+    /// If there is no data available in `inp`, returns `Ok(0)` if the
+    /// EOF has been reached, otherwise
+    /// `Err(ErrorKind::WouldBlock.into())`
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        if self.wr == self.rd {
+            if self.inp_eof {
+                Ok(0)
+            } else {
+                Err(ErrorKind::WouldBlock.into())
+            }
+        } else {
+            let len = buf.len().min(self.wr - self.rd);
+            buf[..len].copy_from_slice(&self.inp[self.rd..self.rd + len]);
+            self.rd += len;
+            Ok(len)
+        }
+    }
+}
+
+impl std::io::Write for TcpStreamBuf {
+    /// Write data into the `out` buffer
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        let len = buf.len();
+        self.out.extend_from_slice(buf);
+        Ok(len)
+    }
+
+    /// Flush does nothing because we consider the end-target of the
+    /// write to be the `TcpStreamBuf::out` buffer
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
     }
 }
 

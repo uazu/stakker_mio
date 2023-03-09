@@ -39,6 +39,9 @@ mod tcpstrbuf;
 mod udpqueue;
 mod udpserverqueue;
 
+#[cfg(feature = "rustls")]
+mod tls_rustls;
+
 #[cfg(test)]
 mod test;
 
@@ -46,6 +49,9 @@ pub use miopoll::{MioPoll, MioSource, Ready};
 pub use tcpstrbuf::{ReadStatus, TcpStreamBuf};
 pub use udpqueue::UdpQueue;
 pub use udpserverqueue::UdpServerQueue;
+
+#[cfg(feature = "rustls")]
+pub use tls_rustls::{TlsEof, TlsError, TlsServerEngine};
 
 #[cfg(unix)]
 mod fdsource;
