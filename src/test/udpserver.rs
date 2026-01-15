@@ -22,7 +22,7 @@ pub fn test_udpserver() {
         ret_shutdown!(s)
     );
 
-    super::run(s);
+    super::run(s).expect("I/O failure");
 
     let reason = s.shutdown_reason().unwrap();
     assert!(

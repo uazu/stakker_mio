@@ -94,7 +94,9 @@ impl MioPoll {
             poll,
             token_map,
             queues: Default::default(),
+            n_queued: 0,
             max_pri: waker_pri,
+            priorities: 1 << waker_pri,
             events,
             errors: Vec::new(),
             waker,
@@ -149,20 +151,46 @@ impl MioPoll {
         })
     }
 
-    /// Poll for new events and queue all the events of the highest
-    /// available priority level.  Events of lower priority levels are
-    /// queued internally to be used on a future call to this method.
+    /// Poll for new events and process all the events of the highest
+    /// available priority level (calling their `Fwd` handlers).
+    /// Events of lower priority levels are queued internally to be
+    /// processed on a future call to this method.
     ///
     /// So the expected pattern is that highest-priority handlers get
     /// run, and when all the resulting processing has completed in
-    /// **Stakker**, then the main loop polls again, and if more
-    /// high-priority events have occurred, then those too will get
-    /// processed.  Lower-priority handlers will only get a chance to
-    /// run when nothing higher-priority needs handling.
+    /// **Stakker** (via the `stakker.run()` method), then when the
+    /// main loop polls again, if more high-priority events have
+    /// occurred, then those too will get processed, otherwise the
+    /// next-highest priority events are processed.  Lower-priority
+    /// handlers will only get a chance to run when nothing
+    /// higher-priority needs handling.
     ///
-    /// On success returns `Ok(true)` if an event was processed, or
-    /// `Ok(false)` if there were no new events.
-    pub fn poll(&self, max_delay: Duration) -> Result<bool> {
+    /// On success returns `Ok((activity, io_pending))`.  The flag
+    /// `activity` is `true` if one or more events were processed, and
+    /// `io_pending` is `true` if some events were processed but there
+    /// are queued I/O events of a lower priority that still need to
+    /// be processed by a future call to this method.
+    ///
+    /// Example use of `io_pending` in a main loop:
+    ///
+    /// ```no_run
+    ///# use stakker::Stakker;
+    ///# use stakker_mio::MioPoll;
+    ///# use std::time::{Duration, Instant};
+    ///# fn test(stakker: &mut Stakker, miopoll: &mut MioPoll) -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut idle_pending = stakker.run(Instant::now(), false);
+    /// let mut io_pending = false;
+    /// let mut activity;
+    /// const MAX_WAIT: Duration = Duration::from_secs(60);
+    /// while stakker.not_shutdown() {
+    ///     let maxdur = stakker.next_wait_max(Instant::now(), MAX_WAIT, idle_pending || io_pending);
+    ///     (activity, io_pending) = miopoll.poll(maxdur)?;
+    ///     idle_pending = stakker.run(Instant::now(), !activity);
+    /// }
+    ///# Ok(())
+    ///# }
+    /// ```
+    pub fn poll(&self, max_delay: Duration) -> Result<(bool, bool)> {
         self.rc.borrow_mut().poll(max_delay)
     }
 
@@ -210,7 +238,9 @@ struct Control {
     // Highest priority in use goes on a fast path so we need queues
     // only for 0..=9
     queues: [Vec<QueueEvent>; MAX_PRI as usize],
+    n_queued: usize,
     max_pri: u32,
+    priorities: u16, // Bitmap of priorities in use
     events: Events,
     errors: Vec<Error>,
     waker: Arc<Waker>,
@@ -237,12 +267,13 @@ impl Control {
     ) -> Result<Token> {
         let pri = pri.min(MAX_PRI);
         self.max_pri = self.max_pri.max(pri);
+        self.priorities |= 1 << pri;
         let token = Token(self.token_map.insert(Entry { pri, fwd }));
         retry(|| self.poll.registry().register(handle, token, ready))?;
         Ok(token)
     }
 
-    fn poll(&mut self, max_delay: Duration) -> Result<bool> {
+    fn poll(&mut self, max_delay: Duration) -> Result<(bool, bool)> {
         retry(|| self.poll.poll(&mut self.events, Some(max_delay)))?;
         let mut done = false;
         for ev in &self.events {
@@ -257,26 +288,32 @@ impl Control {
                     entry.fwd.fwd(ready);
                 } else {
                     self.queues[entry.pri as usize].push(QueueEvent { token, ready });
+                    self.n_queued += 1;
                 }
             }
         }
         self.events.clear();
-        if !done {
-            for qu in self.queues.iter_mut().rev() {
-                if !qu.is_empty() {
-                    for qev in qu.drain(..) {
-                        if let Some(ref mut entry) = self.token_map.get_mut(qev.token) {
-                            done = true;
-                            entry.fwd.fwd(qev.ready);
+
+        if !done && self.n_queued > 0 {
+            self.n_queued = 0;
+            for i in (0..self.max_pri as usize).rev() {
+                let qu = &mut self.queues[i];
+                if 0 != (self.priorities & (1 << i)) && !qu.is_empty() {
+                    if !done {
+                        for qev in qu.drain(..) {
+                            if let Some(ref mut entry) = self.token_map.get_mut(qev.token) {
+                                done = true;
+                                entry.fwd.fwd(qev.ready);
+                            }
                         }
-                    }
-                    if done {
-                        break;
+                    } else {
+                        self.n_queued += qu.len();
                     }
                 }
             }
         }
-        Ok(done)
+        let pending = self.n_queued > 0;
+        Ok((done, pending))
     }
 
     fn set_wake_fwd(&mut self, fwd: Fwd<Ready>) {

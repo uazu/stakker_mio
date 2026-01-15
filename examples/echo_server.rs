@@ -43,16 +43,20 @@ const PORT: u16 = 7777;
 fn main() -> Result<(), Box<dyn Error>> {
     let mut stakker = Stakker::new(Instant::now());
     let s = &mut stakker;
-    let miopoll = MioPoll::new(s, Poll::new()?, Events::with_capacity(1024), 0)?;
+    let miopoll = MioPoll::new(s, Poll::new()?, Events::with_capacity(1024), 10)?;
 
     let _listener = actor!(s, Listener::init(), ret_shutdown!(s));
 
-    // Don't need `idle!` handling
-    s.run(Instant::now(), false);
+    // Don't need `idle!` handling, but run a full event loop in case
+    // someone wants to copy this
+    let mut idle_pending = s.run(Instant::now(), false);
+    let mut io_pending = false;
+    let mut activity;
+    const MAX_WAIT: Duration = Duration::from_secs(60);
     while s.not_shutdown() {
-        let maxdur = s.next_wait_max(Instant::now(), Duration::from_secs(60), false);
-        miopoll.poll(maxdur)?;
-        s.run(Instant::now(), false);
+        let maxdur = s.next_wait_max(Instant::now(), MAX_WAIT, idle_pending || io_pending);
+        (activity, io_pending) = miopoll.poll(maxdur)?;
+        idle_pending = s.run(Instant::now(), !activity);
     }
 
     println!("Shutdown: {}", s.shutdown_reason().unwrap());

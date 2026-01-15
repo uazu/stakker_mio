@@ -140,7 +140,7 @@ impl UdpServerQueue {
                             // Not exactly the correct error, but has similar meaning
                             Err(ErrorKind::WriteZero.into())
                         }
-                        Ok(_) => Ok(()),
+                        Ok(_) => break,
                     };
                 }
             }

@@ -2,6 +2,42 @@
 
 <!-- see keepachangelog.com for format ideas -->
 
+## 0.3.0 (2026-01-14)
+
+Update to `mio` 1.1, which requires MSRV 1.71
+
+### Breaking change
+
+- `MioPoll::poll` now returns two values on success: `(activity,
+  io_pending)`.  This is because the example main loop I/O code in
+  `stakker` crate did not behave correctly when more than one I/O
+  priority level was triggered within the same poll.  The example code
+  would do a poll-sleep even though there were more I/O events still
+  to process, meaning that those events would be processed late.  The
+  `MioPoll::poll` call was behaving correctly (as described), and its
+  behaviour has not been changed, but to make sure people get their
+  main loops corrected and to simplify the fix, the signature was
+  changed to return the `io_pending` value.
+
+  A correct main loop now looks like this:
+
+  ```
+    let mut idle_pending = stakker.run(Instant::now(), false);
+    let mut io_pending = false;
+    let mut activity;
+    const MAX_WAIT: Duration = Duration::from_secs(60);
+    while stakker.not_shutdown() {
+        let maxdur = stakker.next_wait_max(Instant::now(), MAX_WAIT, idle_pending || io_pending);
+        (activity, io_pending) = miopoll.poll(maxdur)?;
+        idle_pending = stakker.run(Instant::now(), !activity);
+    }
+  ```
+
+### Fixed
+
+- UDP queues flush operation didn't flush all packets
+
+
 ## 0.2.5 (2023-03-14)
 
 ### Added

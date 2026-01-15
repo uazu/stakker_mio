@@ -38,21 +38,26 @@ fn init() -> Stakker {
         &mut stakker,
         Poll::new().expect("Poll::new failed"),
         Events::with_capacity(1024),
-        0, // Wake priority
+        10, // Wake priority
     )
     .expect("MioPoll::new failed");
     stakker
 }
 
-/// Run event loop.  Don't need timers or idle queue for this test.
-fn run(s: &mut Stakker) {
+/// Run event loop.  Don't need timers or idle queue for this test,
+/// but run a full event loop anyway in case someone copies this code.
+fn run(s: &mut Stakker) -> std::io::Result<()> {
     let miopoll = s.anymap_get::<MioPoll>();
-    let now = Instant::now();
-    s.run(now, false);
+
+    let mut idle_pending = s.run(Instant::now(), false);
+    let mut io_pending = false;
+    let mut activity;
+    const MAX_WAIT: Duration = Duration::from_secs(60);
     while s.not_shutdown() {
-        if let Err(e) = miopoll.poll(Duration::from_secs(1)) {
-            panic!("MioPoll failure: {}", e);
-        }
-        s.run(now, false);
+        let maxdur = s.next_wait_max(Instant::now(), MAX_WAIT, idle_pending || io_pending);
+        (activity, io_pending) = miopoll.poll(maxdur)?;
+        idle_pending = s.run(Instant::now(), !activity);
     }
+
+    Ok(())
 }

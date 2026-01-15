@@ -22,7 +22,7 @@ pub fn test_udp() {
     let send = actor!(s, Sender::init(send_sock), ret_shutdown!(s));
     let _recv = actor!(s, Receiver::init(recv_sock, send.clone()), ret_shutdown!(s));
 
-    super::run(s);
+    super::run(s).expect("I/O failure");
 
     let reason = s.shutdown_reason().unwrap();
     assert!(
